@@ -1,0 +1,27 @@
+# 大型模型/数据集
+*.pth
+*.ckpt
+*.onnx
+*.zip
+*.rar
+*.tar
+*.7z
+# 缓存、图片、日志
+__pycache__/
+*.pyc
+*.log
+output/
+temp/
+dataset/
+weights/
+venv/
+# 屏蔽所有图片文件
+*.jpg
+*.png
+*.jpeg
+*.bmp
+*.chip.jpg
+# 图片存放文件夹（如果有单独目录直接写文件夹名）
+imgs/
+images/
+dataset/
