@@ -1,6 +1,6 @@
 # MultiFace — 基于人脸图像的性别与年龄预测
 
-基于 PyTorch 的多任务深度学习项目，输入一张人脸图片，同时预测**性别**（男/女）和**年龄**（连续值）。使用 ResNet 骨干网络 + 双输出头架构，端到端训练。
+基于 PyTorch 的多任务深度学习项目，输入一张人脸图片，同时预测**性别**（男/女）和**年龄**。年龄使用 117 类 Softmax 分类 + 期望回归（DEX 方法），损失函数为 CE + λ×MAE 联合损失。采用分阶段训练策略：先冻结性别头训练年龄头，再解冻联合微调，不同组件使用差异化学习率。
 
 ---
 
@@ -104,25 +104,27 @@ python model.py
            │
   ┌────────┴────────┐
   │                 │
-┌─▼────────┐  ┌─────▼──────┐
-│ 性别分类头 │  │  年龄回归头  │
-│ FC 256    │  │  FC 256     │
-│ BN + ReLU │  │  BN + ReLU  │
-│ Dropout   │  │  Dropout    │
-│ FC 128    │  │  FC 128     │
-│ BN + ReLU │  │  BN + ReLU  │
-│ Dropout   │  │  Dropout    │
-│ FC 2      │  │  FC 1       │
-│ → 男/女   │  │  → 年龄值    │
-└──────────┘  └────────────┘
+┌─▼────────┐  ┌─────▼────────┐
+│ 性别分类头 │  │  年龄分类头    │
+│ FC 256    │  │  FC 256       │
+│ BN + ReLU │  │  BN + ReLU    │
+│ Dropout   │  │  Dropout      │
+│ FC 128    │  │  FC 128       │
+│ BN + ReLU │  │  BN + ReLU    │
+│ Dropout   │  │  Dropout      │
+│ FC 2      │  │  FC 117       │  ← 0-116 岁每岁一个类别
+│ → 男/女   │  │  → Softmax    │
+└──────────┘  │  → 期望年龄     │  ← sum(prob[i] × i)
+              └──────────────┘
 ```
 
 - **骨干网络**: ResNet18（ImageNet 预训练），可更换为 ResNet34/50 或 MobileNetV2
 - **性别任务**: 二分类，CrossEntropyLoss
-- **年龄任务**: 回归，L1Loss（MAE）
-- **总损失**: `Loss = GenderLoss + 0.4 × AgeLoss`
-- **优化器**: AdamW
+- **年龄任务**: 117 类 Softmax 分类 + 期望回归（DEX），`AgeLoss = CE + 0.5 × MAE`
+- **总损失**: `Loss = GenderLoss + AgeLoss`
+- **优化器**: AdamW，骨干/性别头/年龄头使用差异化学习率
 - **学习率调度**: StepLR（每 15 epoch × 0.5）
+- **训练策略**: 分两阶段——前 50% epoch 冻结性别头只训年龄头，后 50% 解冻联合训练
 
 ---
 
@@ -133,8 +135,10 @@ python model.py
 | 指标 | 说明 |
 |------|------|
 | **Gender Loss** | 性别分类交叉熵损失 |
-| **Age Loss** | 年龄回归 L1 损失 |
-| **Total Loss** | 加权总损失 |
+| **Age CE** | 年龄 117 类 Softmax 交叉熵损失 |
+| **Age MAE Loss** | 期望年龄与真实年龄的 L1 损失 |
+| **Age Loss** | 年龄联合损失 = CE + λ × MAE |
+| **Total Loss** | 总损失 = GenderLoss + AgeLoss |
 | **Gender Acc** | 性别分类准确率 (%) |
 | **Age MAE** | 年龄预测平均绝对误差 (年) |
 | **Age RMSE** | 年龄预测均方根误差 (年) |
@@ -159,15 +163,19 @@ BATCH_SIZE = 128  # 批次大小
 NUM_WORKERS = 4   # DataLoader 并行进程数
 
 # 模型
-BACKBONE = "resnet18"   # 骨干网络：resnet18 / resnet34 / resnet50 / mobilenet_v2
-PRETRAINED = True       # 是否使用预训练权重
-AGE_LOSS_WEIGHT = 0.4   # 年龄损失占总损失的权重
+BACKBONE = "resnet18"      # 骨干网络：resnet18 / resnet34 / resnet50 / mobilenet_v2
+PRETRAINED = True          # 是否使用预训练权重
+NUM_AGE_CLASSES = 117      # 年龄类别数 (0-116 岁全覆盖)
+AGE_CE_LAMBDA = 0.5        # CE+MAE 联合损失中 MAE 的权重
 
 # 训练
-EPOCHS = 30             # 最大训练轮数
-LEARNING_RATE = 1e-4    # 学习率
-WEIGHT_DECAY = 1e-4     # 权重衰减
-EARLY_STOP_PATIENCE = 10  # 早停耐心值
+EPOCHS = 30                # 最大训练轮数
+WEIGHT_DECAY = 1e-4        # 权重衰减
+STAGE_SPLIT = 0.5          # 分阶段训练：前 50% epoch 冻结性别头
+BACKBONE_LR = 1e-5         # 骨干网络学习率（预训练权重，低）
+GENDER_HEAD_LR = 1e-4      # 性别头学习率（中）
+AGE_HEAD_LR = 2e-4         # 年龄头学习率（从头训练，高）
+EARLY_STOP_PATIENCE = 10   # 早停耐心值
 ```
 
 ---

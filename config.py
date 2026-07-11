@@ -37,15 +37,22 @@ AGE_BINS = [0, 10, 20, 30, 40, 50, 60, 70, 120]
 BACKBONE = "resnet18"         # 骨干网络: resnet18 / resnet34 / resnet50 / mobilenet_v2
 PRETRAINED = True             # 是否使用 ImageNet 预训练权重
 GENDER_CLASSES = 2            # 性别类别数 (男/女)
-AGE_LOSS_WEIGHT = 0.4         # 年龄损失权重 (总损失 = gender_loss + AGE_LOSS_WEIGHT * age_loss)
+NUM_AGE_CLASSES = 117         # 年龄类别数 (0-116岁, 完全覆盖UTKFace数据集范围)
+AGE_CE_LAMBDA = 0.5           # CE+MAE联合损失中MAE的权重
 
 # ============================================================
 # 训练配置
 # ============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 30                   # 训练总轮数 (对于该数据集通常已足够收敛)
-LEARNING_RATE = 1e-4          # 初始学习率
+EPOCHS = 60                   # 训练总轮数 (对于该数据集通常已足够收敛)
 WEIGHT_DECAY = 1e-4           # 权重衰减 (L2 正则化)
+
+# 分阶段训练 + 不同头不同学习率
+STAGE_SPLIT = 0.5             # 前 50% epoch 冻结性别头, 只训年龄头+骨干
+BACKBONE_LR = 1e-5            # 骨干网络学习率 (预训练权重, 用较小LR微调)
+GENDER_HEAD_LR = 1e-4         # 性别头学习率
+AGE_HEAD_LR = 2e-4            # 年龄头学习率 (从头训练, 用较大LR)
+
 LR_STEP_SIZE = 15             # 每 N 个 epoch 降低学习率
 LR_GAMMA = 0.5                # 学习率衰减因子
 EARLY_STOP_PATIENCE = 10      # 早停耐心值 (验证 loss 不降则停止)
@@ -61,9 +68,13 @@ def print_config():
     print(f"  图像尺寸:     {IMG_SIZE}×{IMG_SIZE}")
     print(f"  批次大小:     {BATCH_SIZE}")
     print(f"  骨干网络:     {BACKBONE} (pretrained={PRETRAINED})")
+    print(f"  年龄类别数:   {NUM_AGE_CLASSES} (0-{NUM_AGE_CLASSES-1}岁)")
+    print(f"  年龄损失:     CE + {AGE_CE_LAMBDA}×MAE")
     print(f"  训练设备:     {DEVICE}")
     print(f"  训练轮数:     {EPOCHS}")
-    print(f"  学习率:       {LEARNING_RATE}")
-    print(f"  年龄损失权重: {AGE_LOSS_WEIGHT}")
+    print(f"  骨干网络 LR:  {BACKBONE_LR}")
+    print(f"  性别头 LR:    {GENDER_HEAD_LR}")
+    print(f"  年龄头 LR:    {AGE_HEAD_LR}")
+    print(f"  分阶段训练:   前{int(STAGE_SPLIT*100)}%冻结性别头")
     print(f"  输出目录:     {OUTPUT_DIR}")
     print("=" * 60)

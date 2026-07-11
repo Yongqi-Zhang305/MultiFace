@@ -18,17 +18,18 @@
  │ FC 256   │      │  FC 256    │
  │ ReLU     │      │  ReLU      │
  │ Dropout  │      │  Dropout   │
- │ FC 2     │      │  FC 1      │
- │ Softmax  │      │  (回归值)   │
+ │ FC 2     │      │  FC 101    │
+ │ Softmax  │      │  Softmax   │
  └─────────┘      └───────────┘
-  Gender cls           Age reg
+  Gender cls        Age 101 cls
+                 → 期望年龄 (加权求和)
 """
 
 import torch
 import torch.nn as nn
 from torchvision import models
 
-from config import GENDER_CLASSES, BACKBONE, PRETRAINED
+from config import GENDER_CLASSES, NUM_AGE_CLASSES, BACKBONE, PRETRAINED
 
 
 class MultiTaskModel(nn.Module):
@@ -53,7 +54,7 @@ class MultiTaskModel(nn.Module):
             nn.Linear(128, GENDER_CLASSES),
         )
 
-        # ── 年龄回归头 ──
+        # ── 年龄分类头 (101 类 Softmax → 期望年龄) ──
         self.age_head = nn.Sequential(
             nn.Linear(self.feature_dim, 256),
             nn.BatchNorm1d(256),
@@ -63,7 +64,7 @@ class MultiTaskModel(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.3),
-            nn.Linear(128, 1),
+            nn.Linear(128, NUM_AGE_CLASSES),  # 输出 0-100 岁每类的分数
         )
 
         self._init_heads()
@@ -112,13 +113,29 @@ class MultiTaskModel(nn.Module):
             x: 输入图像 tensor, shape (B, 3, H, W)
 
         Returns:
-            gender_out: (B, 2) 性别分类 logits
-            age_out:    (B, 1) 年龄回归值
+            gender_out:  (B, 2)   性别分类 logits
+            age_logits:  (B, 101) 年龄分类 logits (0-100岁)
         """
-        features = self.backbone(x)            # (B, feature_dim)  — Identity 已替代 FC
+        features = self.backbone(x)            # (B, feature_dim)
         gender_out = self.gender_head(features)
-        age_out = self.age_head(features)
-        return gender_out, age_out
+        age_logits = self.age_head(features)   # (B, NUM_AGE_CLASSES)
+        return gender_out, age_logits
+
+
+def compute_expected_age(age_logits):
+    """从 101 类 Softmax 概率计算期望年龄 (DEX 方法)
+
+    Args:
+        age_logits: (B, NUM_AGE_CLASSES) 年龄分类 logits
+
+    Returns:
+        expected_age: (B,) 年龄期望值 = sum(softmax(logits)[i] * i)
+    """
+    probs = torch.softmax(age_logits, dim=1)  # (B, 101)
+    indices = torch.arange(
+        age_logits.size(1), dtype=torch.float32, device=age_logits.device
+    )  # [0, 1, 2, ..., 100]
+    return (probs * indices).sum(dim=1)       # (B,)
 
 
 def build_model():
@@ -138,16 +155,17 @@ def build_model():
 
 
 def get_loss_functions():
-    """返回两个任务的损失函数"""
+    """返回损失函数 (性别分类器用 CrossEntropy, 年龄在 train.py 中手动计算 CE+MAE)"""
     gender_criterion = nn.CrossEntropyLoss()
-    age_criterion = nn.L1Loss()
-    return gender_criterion, age_criterion
+    return gender_criterion
 
 
 if __name__ == "__main__":
     model = build_model()
     dummy_input = torch.randn(4, 3, 224, 224).to(next(model.parameters()).device)
-    gender_out, age_out = model(dummy_input)
-    print(f"[检查] 输入形状: {dummy_input.shape}")
-    print(f"[检查] 性别输出: {gender_out.shape}  (期望: [4, 2])")
-    print(f"[检查] 年龄输出: {age_out.shape}  (期望: [4, 1])")
+    gender_out, age_logits = model(dummy_input)
+    expected_age = compute_expected_age(age_logits)
+    print(f"[检查] 输入形状:   {dummy_input.shape}")
+    print(f"[检查] 性别输出:   {gender_out.shape}   (期望: [4, 2])")
+    print(f"[检查] 年龄 logits: {age_logits.shape} (期望: [4, {NUM_AGE_CLASSES}])")
+    print(f"[检查] 期望年龄:   {expected_age}")

@@ -182,7 +182,7 @@ ResNet 的巧妙之处是加了一条「快速通道」：
 ```
                           ┌→ 性别分类头 → 输出: 男/女
 ResNet18（共享特征提取）→
-                          └→ 年龄回归头 → 输出: 年龄值
+                          └→ 年龄分类头 → 输出: 117类概率 → 期望年龄
 ```
 
 - 「男性」和「老年人」可能有相关的视觉特征（如皱纹、发际线）
@@ -208,13 +208,17 @@ ResNet18（共享特征提取）→
 | 任务 | 损失函数 | 全称 | 含义 |
 |------|---------|------|------|
 | 性别 | CrossEntropyLoss | 交叉熵损失 | 衡量两个概率分布之间的差异 |
-| 年龄 | L1Loss | L1 损失 / MAE | 衡量预测值与真实值之间的绝对差距 |
+| 年龄 | CE + λ×MAE | 联合损失 | CE: 117类分类的交叉熵; MAE: 期望年龄与真实年龄的L1距离 |
 
-**为什么年龄用 L1Loss 而不是 L2Loss（MSE）？**
-- L1Loss：`|预测 - 真实|`，对异常值不那么敏感
-- L2Loss：`(预测 - 真实)²`，对异常值非常敏感（差距大时惩罚极大）
+**为什么年龄用联合损失（CE + λ×MAE）？**
 
-UTKFace 数据集中有 0~116 岁的人，年龄跨度很大，用 L1Loss 更稳。
+年龄既是一个「类别问题」（几岁），又天然带有「距离信息」（30岁和31岁接近，和60岁很远）。单纯用回归（L1Loss）难以训练，单纯用分类（CrossEntropy）丢失距离。联合损失取了两者之长：
+
+- **CE（交叉熵）**：让模型输出 117 个类别的概率分布，分类任务稳定好训
+- **MAE（期望年龄 vs 真实年龄）**：从概率分布算期望年龄 `sum(p_i × i)`，用 L1 约束它靠近真实年龄，保留了「30 比 60 更接近 31」的距离信息
+- **λ = 0.5**：调节两项的权重，CE 主导训练方向，MAE 提供距离感知
+
+UTKFace 数据集中有 0~116 岁的人，直接用 L1Loss 回归的话大龄误差会主导梯度，而联合损失通过分类把误差分散到 117 个类别上，训练更稳定。
 
 ---
 
@@ -230,7 +234,7 @@ UTKFace 数据集中有 0~116 岁的人，年龄跨度很大，用 L1Loss 更稳
 
 优化器的核心任务是**调整模型的参数（权重和偏置）**，使得下一次预测的损失更小。
 
-**本项目使用的优化器 —— AdamW：**
+**本项目使用的优化器 —— **AdamW**，并且不同组件使用**差异化学习率**：**
 
 AdamW 是目前最主流的优化器之一。它的核心思想是**自适应学习率**：每个参数有不同的调整速度，有些参数需要大步调整，有些需要小步微调。
 
@@ -483,14 +487,19 @@ GENDER_CLASSES = 2
 性别分类的类别数。2 就是「男」和「女」。
 
 ```python
-AGE_LOSS_WEIGHT = 0.4
+NUM_AGE_CLASSES = 117
 ```
-年龄损失的权重。因为总损失 = 性别损失 + 0.4 × 年龄损失。为什么是 0.4？
-- 年龄回归任务比性别分类更难，损失值天然更大
+年龄类别总数。0-116 岁每个年龄一个类别，完全覆盖 UTKFace 数据集的年龄范围。为什么不是 101？因为 UTKFace 中年龄最大到 116 岁，用 117 类才能确保每个样本都有精准对应的类别，不会被钳位（clamp）到 100 导致失真。
+
+```python
+AGE_CE_LAMBDA = 0.5
+```
+联合损失中 MAE 的权重。年龄总损失 = CE（117 类交叉熵）+ 0.5 × MAE（期望年龄的 L1 距离）。
+- 之前用纯回归时 AGE_LOSS_WEIGHT = 0.4，现在因为 CE 已经承担了主要训练信号，MAE 只作为辅助，lambda = 0.5 是一个较平衡的值
 - 如果权重是 1.0，年龄损失会主导训练，性别任务学不好
 - 0.4 是通过实验找出来的平衡点
 
-### 2.5 训练配置（第 43-51 行）
+### 2.5 训练配置
 
 ```python
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -503,22 +512,32 @@ EPOCHS = 30
 最多训练 30 轮。实际可能因为早停在 15-20 轮左右提前结束。
 
 ```python
-LEARNING_RATE = 1e-4    # 0.0001
-```
-学习率。`1e-4` 是科学计数法，等于 0.0001。这是迁移学习常用的较小学习率——因为预训练权重已经很好，我们只需要微调。
-
-```python
 WEIGHT_DECAY = 1e-4
 ```
 权重衰减，一种正则化手段，防止模型参数过大导致过拟合。
 
 ```python
+STAGE_SPLIT = 0.5
+```
+分阶段训练的前后比例。0.5 表示前 50%（15 轮）为阶段一（冻结性别头），后 50%（15 轮）为阶段二（全参数联合训练）。
+
+```python
+BACKBONE_LR = 1e-5
+GENDER_HEAD_LR = 1e-4
+AGE_HEAD_LR = 2e-4
+```
+**不同组件使用不同的学习率**，这是本项目的一个重要训练策略：
+- 骨干网络（ResNet18）：`1e-5`，最低。ImageNet 预训练权重已经很好，只需要小幅微调
+- 性别头：`1e-4`，中等。从头训练但任务简单（二分类）
+- 年龄头：`2e-4`，最高。从头训练且任务最复杂（117 类分类+回归）
+
+```python
 LR_STEP_SIZE = 15
 LR_GAMMA = 0.5
 ```
-学习率调度参数：每 15 个 epoch，学习率乘以 0.5。比如：
-- Epoch 1-15：lr = 0.0001
-- Epoch 16+：lr = 0.00005
+学习率调度参数：每 15 个 epoch，**所有**学习率乘以 0.5。比如：
+- Epoch 1-15：backbone=1e-5, gender=1e-4, age=2e-4
+- Epoch 16+：backbone=5e-6, gender=5e-5, age=1e-4
 
 ```python
 EARLY_STOP_PATIENCE = 10
@@ -898,12 +917,21 @@ def __init__(self, backbone_name=BACKBONE, pretrained=PRETRAINED):
         nn.BatchNorm1d(128),
         nn.ReLU(inplace=True),
         nn.Dropout(p=0.3),
-        nn.Linear(128, 1),       # ← 注意：输出 1 个数，不是 2！
+        nn.Linear(128, NUM_AGE_CLASSES),  # ← 117类输出 (0-116岁)
     )
 ```
 年龄头结构和性别头完全对称，只有最后一层不同：
 - 性别最后一层输出 2 个值（男和女的得分）
-- 年龄最后一层输出 1 个值（直接就是年龄预测值）
+- 年龄最后一层输出 **117 个值**（0 到 116 岁每个年龄的得分）
+
+这 117 个分数经过 Softmax 后变成概率分布，然后做**期望加权求和**得到最终的年龄预测值：
+```python
+expected_age = sum(softmax(logits)[i] × i  for i in 0..116)
+```
+比如模型认为有 20% 概率是 30 岁、60% 概率是 31 岁、20% 概率是 32 岁，
+期望年龄 = 0.2×30 + 0.6×31 + 0.2×32 = 31.0 岁。
+
+这就是 DEX（Deep EXpectation）方法，既保留了分类的稳定性，又通过加权求和得到连续的年龄值。
 
 ```python
     self._init_heads()
@@ -975,8 +1003,14 @@ def forward(self, x):
 1. `x`（一批图片）进入 ResNet 骨干 → 输出 512 维特征向量
 2. 特征向量同时送入性别头和年龄头
 3. 性别头输出 `(batch_size, 2)` 的张量（每张图片两个分数）
-4. 年龄头输出 `(batch_size, 1)` 的张量（每张图片一个年龄值）
+4. 年龄头输出 `(batch_size, 117)` 的 logits（每张图片 117 个年龄类别的得分）
 5. 返回两个结果
+
+之后在 train.py 中，年龄 logits 会经过两个处理：
+- 直接与年龄标签计算 **CE 损失**（分类）
+- 经 Softmax → 期望加权求和 → 与真实年龄计算 **MAE 损失**（距离）
+
+模型新增了一个工具函数 `compute_expected_age()` 专门做这个加权求和。
 
 ### 4.6 build_model() 工厂函数（第 124-137 行）
 
@@ -998,17 +1032,24 @@ def build_model():
 
 为什么需要区分？某些高级技巧会把部分参数「冻结」（设置 `requires_grad=False`），只训练其他部分。虽然本项目没有冻结参数，但打印出这个信息有助于你未来做更复杂的实验。
 
-### 4.7 get_loss_functions() 函数（第 140-144 行）
+### 4.7 get_loss_functions() 函数
 
 ```python
 def get_loss_functions():
     gender_criterion = nn.CrossEntropyLoss()
-    age_criterion = nn.L1Loss()
-    return gender_criterion, age_criterion
+    return gender_criterion
 ```
 
 - `nn.CrossEntropyLoss()`：交叉熵损失，PyTorch 中做分类任务的标准选择。它内部自动包含了 Softmax 操作，所以模型输出不需要先过 Softmax。
-- `nn.L1Loss()`：L1 损失 = 预测值与真实值的绝对差。对离群值（如极端年龄）比 L2 损失更鲁棒。
+- 注意：年龄的损失函数不在 model.py 中定义，而是在 train.py 中手动组合 CE + MAE，因为需要先从 117 类 logits 算出期望年龄再求 MAE，PyTorch 没有现成的联合损失函数。
+
+此外，model.py 新增了 `compute_expected_age()` 工具函数，从 117 类 logits 计算期望年龄：
+```python
+def compute_expected_age(age_logits):
+    probs = torch.softmax(age_logits, dim=1)
+    indices = torch.arange(age_logits.size(1), ...)
+    return (probs * indices).sum(dim=1)
+```
 
 ---
 
@@ -1054,12 +1095,11 @@ def format_time(seconds):
 这是整个项目最长的函数，但逻辑非常清晰。我们一步一步来。
 
 ```python
-def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimizer, epoch):
+def train_one_epoch(model, dataloader, gender_criterion, optimizer, epoch):
 ```
 - `model`：神经网络模型
 - `dataloader`：训练数据加载器
-- `gender_criterion`：性别损失函数
-- `age_criterion`：年龄损失函数
+- `gender_criterion`：性别损失函数（年龄损失在函数内部手动计算 CE+MAE）
 - `optimizer`：优化器
 - `epoch`：当前是第几轮（仅用于打印）
 
@@ -1074,14 +1114,16 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
 
 ```python
     total_gender_loss = 0.0
-    total_age_loss = 0.0
+    total_age_ce = 0.0     # CE 分类损失累加
+    total_age_mae = 0.0    # MAE 距离损失累加
+    total_age_loss = 0.0   # 联合损失累加
     total_loss = 0.0
     correct_gender = 0
     total_samples = 0
     all_pred_ages = []
     all_true_ages = []
 ```
-初始化所有累加器。这些变量在遍历完所有 batch 后用来计算 epoch 级别的平均值。
+初始化所有累加器。年龄用联合损失 CE+MAE，所以需要分别累加 CE 和 MAE 两项，方便后续分析每项各自的变化趋势。
 
 ```python
     for batch_idx, (images, genders, ages) in enumerate(dataloader):
@@ -1093,23 +1135,33 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
 ```python
         images = images.to(DEVICE)
         genders = genders.to(DEVICE)
-        ages = ages.to(DEVICE).float().unsqueeze(1)
+        ages = ages.to(DEVICE).float()  # (B,) 浮点年龄，不做 unsqueeze
+        age_class_labels = ages.round().long().clamp(0, NUM_AGE_CLASSES - 1)
 ```
-`.to(DEVICE)` 把数据从 CPU 内存移到 GPU 显存。`.float()` 确保年龄是浮点类型。`.unsqueeze(1)` 在位置 1 增加一个维度，把 `(128,)` 变成 `(128, 1)`，匹配模型的输出形状。
+`.to(DEVICE)` 把数据从 CPU 内存移到 GPU 显存。`ages` 保持为 `(B,)` 形状的浮点值，同时生成整数类别标签用于 CE 损失——比如真实年龄 35.0 就对应第 35 类。`clamp(0, 116)` 确保超出 0-116 范围的年龄被截断（UTKFace 数据集中有极少数 >116 岁的样本）。
 
 ```python
-        gender_logits, age_preds = model(images)
+        gender_logits, age_logits = model(images)
 ```
-**前向传播**。把图片送入模型，拿到性别 logits 和年龄预测值。
+**前向传播**。把图片送入模型，拿到性别 logits (B,2) 和年龄 logits (B,117)。
 
 **logits 是什么？** logits 就是模型最后一层输出的原始分数，还没有经过 Softmax。比如 `[-3.2, 2.1]` 表示模型认为类别 1（女性）的分数更高。CrossEntropyLoss 内部会自动处理 Softmax，所以不需要我们手动做。
 
 ```python
         loss_g = gender_criterion(gender_logits, genders)
-        loss_a = age_criterion(age_preds, ages)
-        loss = loss_g + AGE_LOSS_WEIGHT * loss_a
+
+        # 年龄联合损失: CE + λ × MAE
+        loss_age_ce = F.cross_entropy(age_logits, age_class_labels)
+        expected_age = compute_expected_age(age_logits)    # Softmax加权求和
+        loss_age_mae = F.l1_loss(expected_age, ages)       # L1距离
+        loss_a = loss_age_ce + AGE_CE_LAMBDA * loss_age_mae
+
+        loss = loss_g + loss_a
 ```
-计算两个损失，然后加权求和。`AGE_LOSS_WEIGHT = 0.4` 意味着年龄任务的重要性是性别任务的 40%。
+年龄损失的计算分三步：
+1. **CE 损失**：117 类交叉熵，把年龄当分类问题。比如「这人是 35 岁」→ 模型必须给第 35 类打最高分
+2. **期望年龄**：`compute_expected_age()` 对 softmax 概率做加权求和，得到连续的年龄值。比如模型认为 30% 概率 34 岁 + 50% 概率 35 岁 + 20% 概率 36 岁 → 期望 = 0.3×34 + 0.5×35 + 0.2×36 = 34.9 岁
+3. **MAE 损失**：期望年龄与真实年龄的 L1 距离，用 `AGE_CE_LAMBDA = 0.5` 加权后与 CE 求和
 
 ```python
         optimizer.zero_grad()
@@ -1130,12 +1182,15 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
         bs = images.size(0)
         total_samples += bs
         total_gender_loss += loss_g.item() * bs
+        total_age_ce += loss_age_ce.item() * bs
+        total_age_mae += loss_age_mae.item() * bs
         total_age_loss += loss_a.item() * bs
         total_loss += loss.item() * bs
 ```
 - `bs`：当前 batch 的实际大小（通常是 128，最后一个 batch 可能更少）
 - `loss_g.item()`：把 PyTorch 的张量转成 Python 的浮点数
 - 乘以 `bs` 是为了加权平均：batch 越大，对总损失的贡献应该越大
+- 年龄的 CE 和 MAE 分开累加，方便在 epoch 结束后分析各项的贡献
 
 ```python
         _, predicted_gender = torch.max(gender_logits, 1)
@@ -1145,7 +1200,7 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
 - `(predicted_gender == genders).sum().item()`：统计这个 batch 中预测正确的数量
 
 ```python
-        all_pred_ages.extend(age_preds.detach().cpu().numpy().flatten())
+        all_pred_ages.extend(expected_age.detach().cpu().numpy().flatten())
         all_true_ages.extend(ages.detach().cpu().numpy().flatten())
 ```
 - `.detach()`：把张量从计算图中分离出来（我们只是收集统计信息，不需要追踪梯度）
@@ -1164,6 +1219,8 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
 
 ```python
     avg_gender_loss = total_gender_loss / total_samples
+    avg_age_ce = total_age_ce / total_samples
+    avg_age_mae = total_age_mae / total_samples
     avg_age_loss = total_age_loss / total_samples
     avg_total_loss = total_loss / total_samples
     gender_acc = correct_gender / total_samples * 100
@@ -1186,7 +1243,7 @@ def train_one_epoch(model, dataloader, gender_criterion, age_criterion, optimize
 
 ```python
 @torch.no_grad()
-def evaluate(model, dataloader, gender_criterion, age_criterion):
+def evaluate(model, dataloader, gender_criterion):
 ```
 
 `@torch.no_grad()` 是装饰器（decorator），它告诉 PyTorch：「下面这个函数里的所有操作都不需要追踪梯度」。这样做两个好处：
@@ -1205,6 +1262,7 @@ def evaluate(model, dataloader, gender_criterion, age_criterion):
 `evaluate()` 的其余逻辑和 `train_one_epoch()` 几乎一样，区别只有：
 - 没有 `optimizer.zero_grad() / loss.backward() / optimizer.step()`（评估时不更新参数）
 - 没有 `model.train()`，而是 `model.eval()`
+- 没有 `age_criterion` 参数（年龄的 CE+MAE 在函数内部手动计算）
 - 没有 batch 进度打印
 
 ### 5.4 log_epoch() —— 记录日志（第 204-262 行）
@@ -1242,12 +1300,23 @@ def log_epoch(epoch, train_metrics, val_metrics, lr, elapsed):
 
 ```python
     label_map = {
-        "Gender Loss": ("train_gender_loss", "val_gender_loss", ".6f"),
-        "Gender Acc":  ("train_gender_acc", "val_gender_acc", ".2f", "%"),
-        ...
+        "Gender Loss":  ("train_gender_loss", "val_gender_loss", ".6f"),
+        "Age CE":       ("train_age_ce", "val_age_ce", ".6f"),
+        "Age MAE Loss": ("train_age_mae_loss", "val_age_mae_loss", ".6f"),
+        "Age Loss":     ("train_age_loss", "val_age_loss", ".6f"),
+        "Total Loss":   ("train_total_loss", "val_total_loss", ".6f"),
+        "Gender Acc":   ("train_gender_acc", "val_gender_acc", ".2f", "%"),
+        "Age MAE":      ("train_age_mae", "val_age_mae", ".2f", " yrs"),
+        "Age RMSE":     ("train_age_rmse", "val_age_rmse", ".2f", " yrs"),
+        "Age Bin Acc":  ("train_age_bin_acc", "val_age_bin_acc", ".2f", "%"),
     }
 ```
-用字典映射中文标签 → CSV 中的键名 + 格式化字符串。`.2f` 表示保留 2 位小数。最后的 `"%"` 和 `" yrs"` 是后缀。
+现在年龄损失分成了三行输出：
+- **Age CE**：117 类交叉熵损失，反映「分类能力」
+- **Age MAE Loss**：期望年龄与真实年龄的 L1 损失，反映「距离感知」
+- **Age Loss**：两者的加权和
+
+CSV 中也相应增加了 `train_age_ce`、`val_age_ce` 等列，方便后续分析两项各自的变化趋势。
 
 ```python
     lines = [
@@ -1267,135 +1336,102 @@ Python 的 f-string 格式化语法：
 
 ## 第六章：main.py 逐行讲解
 
-`main.py` 是整个项目的入口，它把前面所有模块串联成完整的训练流程。
+`main.py` 是整个项目的入口。相比旧版本，现在增加了**分阶段训练**和**差异化学习率**两个关键策略。
 
 ### 6.1 文件头与导入
 
 ```python
 import time
+import math
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
-```
-- `time`：计时
-- `torch.optim`：PyTorch 的优化器模块
-- `StepLR`：阶梯式学习率调度器
 
-```python
 from config import (
-    DEVICE, EPOCHS, LEARNING_RATE, WEIGHT_DECAY, ...
+    DEVICE, EPOCHS, WEIGHT_DECAY,
+    BACKBONE_LR, GENDER_HEAD_LR, AGE_HEAD_LR,  # 三个不同学习率
+    STAGE_SPLIT,                                 # 阶段划分比例
+    ...
 )
-from dataset import create_dataloaders
 from model import build_model, get_loss_functions
 from train import train_one_epoch, evaluate, log_epoch, format_time
 ```
-从其他四个模块导入所有需要的函数和参数。注意模块分工的清晰性：
-- `config` → 参数值
-- `dataset` → 数据
-- `model` → 模型和损失函数
-- `train` → 训练/验证/日志函数
 
-### 6.2 main() 函数 —— 五步走
-
-整个 `main()` 函数可以分为五个阶段。我用 👉 标注每一步做了什么。
-
-**阶段一：数据准备**
-```python
-    print_config()                          # 打印配置摘要
-    print("\n" + "=" * 60)                  # 打印分割线
-    print("  加载数据集...")
-    print("=" * 60)
-    train_loader, val_loader, test_loader, stats = create_dataloaders()
-```
-`\n` 是换行符。调用 `create_dataloaders()` 一次性拿到三个 DataLoader 和统计信息。
-
-**阶段二：模型搭建**
-```python
-    print("\n" + "=" * 60)
-    print("  构建模型...")
-    model = build_model()                    # 创建 MultiTaskModel 并移到 GPU
-    gender_criterion, age_criterion = get_loss_functions()
-
-    optimizer = optim.AdamW(
-        model.parameters(),                  # 告诉优化器要优化哪些参数
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
-```
-- `model.parameters()`：返回模型中所有需要训练的参数
-- `optimizer.AdamW(...)`：创建 AdamW 优化器，绑定到模型的参数上
-- `StepLR(optimizer, ...)`：创建学习率调度器。每 `step_size` 个 epoch，学习率乘以 `gamma`
-
-**阶段三：训练循环**
-```python
-    best_val_loss = float("inf")   # 初始化为无穷大 —— 任何实际值都比它小
-    best_epoch = 0                 # 最佳 epoch 编号
-    patience_counter = 0           # 早停计数器
-    train_start = time.time()      # 记录训练开始时间
-```
+### 6.2 辅助函数：freeze_module 和 build_optimizer
 
 ```python
-    for epoch in range(1, EPOCHS + 1):
+def freeze_module(module, freeze=True):
+    for param in module.parameters():
+        param.requires_grad = not freeze
 ```
-这是最外层的循环，每个 epoch 执行一遍完整的训练+验证流程。
+
+`freeze_module()` 控制一个模块是否参与训练。设置为 `freeze=True` 后，该模块所有参数的 `requires_grad` 变为 `False`，优化器会跳过它们。
 
 ```python
-        epoch_start = time.time()
-
-        train_metrics = train_one_epoch(...)   # 训练一轮
-        val_metrics = evaluate(...)             # 验证一轮
-
-        scheduler.step()                        # 更新学习率
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        elapsed = format_time(time.time() - epoch_start)
-
-        log_epoch(epoch, train_metrics, val_metrics, current_lr, elapsed)
+def build_optimizer(model, stage):
+    if stage == 1:
+        param_groups = [
+            {"params": model.backbone.parameters(),  "lr": BACKBONE_LR},
+            {"params": model.age_head.parameters(),   "lr": AGE_HEAD_LR},
+        ]
+    else:
+        param_groups = [
+            {"params": model.backbone.parameters(),   "lr": BACKBONE_LR},
+            {"params": model.gender_head.parameters(), "lr": GENDER_HEAD_LR},
+            {"params": model.age_head.parameters(),    "lr": AGE_HEAD_LR},
+        ]
+    return optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
 ```
-每个 epoch 的流程：训练 → 验证 → 调整学习率 → 打日志。
 
-**模型保存逻辑：**
+不同阶段，优化器管理的参数组不同：
+- **阶段一**：只有骨干 + 年龄头（性别头冻结，不需要优化器管理）
+- **阶段二**：骨干 + 性别头 + 年龄头，三个组件各用不同的学习率
+
+| 组件 | 学习率 | 原因 |
+|------|--------|------|
+| 骨干 (ResNet18) | `1e-5` | ImageNet 预训练权重已经很好，只需微调 |
+| 性别头 | `1e-4` | 从头训练，但二分类简单，中等 LR 即可 |
+| 年龄头 | `2e-4` | 从头训练 117 类分类，任务最复杂，需要最大 LR |
+
+### 6.3 main() 函数 —— 分阶段训练
+
+整个训练分为**两个阶段**：
+
+**阶段一（Epoch 1 - 15）：冻结性别头，只训练年龄头**
 ```python
-        val_total = val_metrics["total_loss"]
-        if val_total < best_val_loss:
-            best_val_loss = val_total
-            best_epoch = epoch
-            patience_counter = 0
-            torch.save({...}, MODEL_SAVE_PATH)
-        else:
-            patience_counter += 1
-```
-- 如果当前验证损失比历史最佳还低 → 保存模型，早停计数器归零
-- 如果验证损失没下降 → 早停计数器 +1
+    stage1_epochs = int(EPOCHS * STAGE_SPLIT)   # 15 epoch
 
-```python
-        if patience_counter >= EARLY_STOP_PATIENCE:
-            print(f"\n[早停] 验证 loss 已 {EARLY_STOP_PATIENCE} 轮未改善，停止训练。")
-            break
-```
-连续 10 轮不下降就 `break` 退出循环。
+    freeze_module(model.gender_head, freeze=True)   # 冻结性别头
+    optimizer = build_optimizer(model, stage=1)     # 只优化骨干+年龄头
 
-**阶段四：训练总结**
-```python
-    total_time = format_time(time.time() - train_start)
-    print(f"  总耗时:        {total_time}")
-    print(f"  最佳 epoch:    {best_epoch}")
-    print(f"  最佳验证 Loss: {best_val_loss:.4f}")
+    for epoch in range(1, stage1_epochs + 1):
+        train_metrics = train_one_epoch(...)
+        val_metrics = evaluate(...)
+        ...
 ```
 
-**阶段五：测试集评估**
+这个阶段的目的：**让年龄头先学好**。性别是简单任务（二分类，很快就能 90%+），如果从一开始就和年龄一起训练，性别会抢走共享骨干的大部分梯度信号，年龄头就很难学到细粒度特征。先冻结性别头，让骨干网络全力配合年龄头学习皱纹、皮肤纹理等年龄相关特征。
+
+**阶段二（Epoch 16 - 30）：解冻性别头，全参数联合训练**
 ```python
-    checkpoint = torch.load(MODEL_SAVE_PATH, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    freeze_module(model.gender_head, freeze=False)   # 解冻
+    optimizer = build_optimizer(model, stage=2)      # 三个组件各用不同 LR
+
+    for epoch in range(stage1_epochs + 1, EPOCHS + 1):
+        train_metrics = train_one_epoch(...)
+        ...
 ```
-- `torch.load(...)`：从磁盘读取保存的 checkpoint
-- `map_location=DEVICE`：确保模型加载到正确的设备（GPU 或 CPU）
+
+这个阶段的目的：**联合微调**。年龄头已经有了不错的基础，现在让性别头加入，三个组件用差异化学习率一起训练。骨干网络用最低的学习率（保护预训练特征），年龄头维持较高学习率，性别头用中等学习率从头追赶。
+
+**为什么不用一个 for 循环分两个 if 判断？**
+
+两个阶段之间的切换需要重建 optimizer（参数组从 2 组变成 3 组），所以用两个独立的 for 循环更清晰。阶段切换时打印分隔线，日志中也能清楚看到哪个 epoch 属于哪个阶段。
 - `weights_only=False`：允许加载完整的 checkpoint（包含优化器状态等），而不仅仅是模型权重
 - `model.load_state_dict(...)`：把保存的权重恢复到模型中
 
 ```python
-    test_metrics = evaluate(model, test_loader, gender_criterion, age_criterion)
+    test_metrics = evaluate(model, test_loader, gender_criterion)
 ```
 在测试集上做最终评估。注意这里用的是测试集的 DataLoader，而之前训练和验证阶段从没碰过。
 
