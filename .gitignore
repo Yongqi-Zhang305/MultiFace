@@ -15,6 +15,9 @@ data/
 *.swp
 *.swo
 
+# Documentation (large, not for distribution)
+DIRECTION.md
+
 # OS files
 .DS_Store
 Thumbs.db

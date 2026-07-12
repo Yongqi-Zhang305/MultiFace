@@ -20,12 +20,12 @@ import math
 
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from config import (
     DEVICE, EPOCHS, WEIGHT_DECAY,
     BACKBONE_LR, GENDER_HEAD_LR, AGE_HEAD_LR,
-    LR_STEP_SIZE, LR_GAMMA, EARLY_STOP_PATIENCE,
+    LR_ETA_MIN, EARLY_STOP_PATIENCE,
     STAGE_SPLIT, MODEL_SAVE_PATH, LOG_PATH,
     print_config,
 )
@@ -90,7 +90,7 @@ def main():
 
     freeze_module(model.gender_head, freeze=True)
     optimizer = build_optimizer(model, stage=1)
-    scheduler = StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
+    scheduler = CosineAnnealingLR(optimizer, T_max=stage1_epochs, eta_min=LR_ETA_MIN)
 
     print(f"\n[优化器] 参数组数: {len(optimizer.param_groups)}")
     for i, pg in enumerate(optimizer.param_groups):
@@ -146,7 +146,7 @@ def main():
         freeze_module(model.gender_head, freeze=False)
         # 重新构建优化器以包含性别头参数组
         optimizer = build_optimizer(model, stage=2)
-        scheduler = StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
+        scheduler = CosineAnnealingLR(optimizer, T_max=stage2_epochs, eta_min=LR_ETA_MIN)
 
         # 重置 patience 计数器 (阶段切换后给模型更多适应时间)
         patience_counter = 0

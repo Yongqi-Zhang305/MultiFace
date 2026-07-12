@@ -123,7 +123,7 @@ python model.py
 - **年龄任务**: 117 类 Softmax 分类 + 期望回归（DEX），`AgeLoss = CE + 0.5 × MAE`
 - **总损失**: `Loss = GenderLoss + AgeLoss`
 - **优化器**: AdamW，骨干/性别头/年龄头使用差异化学习率
-- **学习率调度**: StepLR（每 15 epoch × 0.5）
+- **学习率调度**: CosineAnnealingLR（余弦退火，平滑衰减至 `1e-7`）
 - **训练策略**: 分两阶段——前 50% epoch 冻结性别头只训年龄头，后 50% 解冻联合训练
 
 ---
@@ -175,6 +175,7 @@ STAGE_SPLIT = 0.5          # 分阶段训练：前 50% epoch 冻结性别头
 BACKBONE_LR = 1e-5         # 骨干网络学习率（预训练权重，低）
 GENDER_HEAD_LR = 1e-4      # 性别头学习率（中）
 AGE_HEAD_LR = 2e-4         # 年龄头学习率（从头训练，高）
+LR_ETA_MIN = 1e-7           # 余弦退火最小学习率
 EARLY_STOP_PATIENCE = 10   # 早停耐心值
 ```
 
